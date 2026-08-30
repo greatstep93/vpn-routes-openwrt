@@ -46,6 +46,61 @@ install_local_pkg() {
     fi
 }
 
+remove_old_packages() {
+    printf "\033[32;1mRemoving old AmneziaWG packages...\033[0m\n"
+    
+    # Список пакетов для удаления
+    OLD_PACKAGES="amneziawg-tools kmod-amneziawg luci-app-amneziawg luci-proto-amneziawg luci-i18n-amneziawg-ru"
+    
+    for pkg in $OLD_PACKAGES; do
+        if is_pkg_installed "$pkg"; then
+            printf "\033[32;1mRemoving $pkg...\033[0m\n"
+            if [ "$PKG_MANAGER" = "apk" ]; then
+                apk del "$pkg" 2>/dev/null
+            else
+                opkg remove "$pkg" 2>/dev/null
+            fi
+        fi
+    done
+}
+
+remove_old_interfaces() {
+    printf "\033[32;1mRemoving old AWG interfaces...\033[0m\n"
+    
+    # Удаляем интерфейс awg0 если существует
+    if uci show network | grep -q "network.awg0"; then
+        printf "\033[32;1mRemoving awg0 interface...\033[0m\n"
+        uci delete network.awg0 2>/dev/null
+        # Удаляем секции peer для awg0
+        PEER_SECTIONS=$(uci show network | grep -E "network.@amneziawg_awg0\[" | awk -F'[=.]' '{print $2}')
+        for section in $PEER_SECTIONS; do
+            printf "\033[32;1mRemoving peer section $section...\033[0m\n"
+            uci delete network.$section 2>/dev/null
+        done
+        uci commit network
+    fi
+    
+    # Удаляем старые зоны фаервола
+    for zone in "awg0" "awg" "awg1"; do
+        ZONE_ID=$(uci show firewall | grep -E "@zone.*name='$zone'" | awk -F'[][{}]' '{print $2}' | head -n 1)
+        if [ ! -z "$ZONE_ID" ]; then
+            printf "\033[32;1mRemoving firewall zone $zone...\033[0m\n"
+            while uci -q delete firewall.@zone[$ZONE_ID]; do :; done
+        fi
+    done
+    
+    # Удаляем старые forwarding правила
+    for dest in "awg0" "awg" "awg1"; do
+        FORWARD_ID=$(uci show firewall | grep -E "@forwarding.*dest='$dest'" | awk -F'[][{}]' '{print $2}' | head -n 1)
+        if [ ! -z "$FORWARD_ID" ]; then
+            printf "\033[32;1mRemoving forwarding rule for $dest...\033[0m\n"
+            while uci -q delete firewall.@forwarding[$FORWARD_ID]; do :; done
+        fi
+    done
+    
+    uci commit firewall
+}
+
 get_pkgarch() {
     PKGARCH_UBUS=$(ubus call system board 2>/dev/null | jsonfilter -e '@.release.arch' 2>/dev/null)
     if [ -n "$PKGARCH_UBUS" ]; then
@@ -244,6 +299,9 @@ configure_amneziawg_interface() {
 
     printf "\033[32;1mConfiguring AmneziaWG interface...\033[0m\n"
 
+    # Сначала удаляем старый интерфейс если есть
+    remove_old_interfaces
+
     read -r -p "Enter the private key (from [Interface]):"$'\n' AWG_PRIVATE_KEY_INT
 
     while true; do
@@ -275,16 +333,15 @@ configure_amneziawg_interface() {
     read -r -p "Enter H3 value (from [Interface]):"$'\n' AWG_H3
     read -r -p "Enter H4 value (from [Interface]):"$'\n' AWG_H4
 
-    # AWG 2.0 новые параметры
-    if [ "$AWG_VERSION" = "2.0" ]; then
-        read -r -p "Enter S3 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_S3
-        read -r -p "Enter S4 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_S4
-        read -r -p "Enter I1 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I1
-        read -r -p "Enter I2 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I2
-        read -r -p "Enter I3 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I3
-        read -r -p "Enter I4 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I4
-        read -r -p "Enter I5 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I5
-    fi
+    # AWG 2.0 новые параметры - теперь спрашиваем всегда
+    printf "\033[32;1mAWG 2.0 additional parameters (optional, press Enter to skip):\033[0m\n"
+    read -r -p "Enter S3 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_S3
+    read -r -p "Enter S4 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_S4
+    read -r -p "Enter I1 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I1
+    read -r -p "Enter I2 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I2
+    read -r -p "Enter I3 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I3
+    read -r -p "Enter I4 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I4
+    read -r -p "Enter I5 value (from [Interface]) [optional, leave blank to skip]:"$'\n' AWG_I5
 
     uci set network.${INTERFACE_NAME}=interface
     uci set network.${INTERFACE_NAME}.proto=$PROTO
@@ -329,6 +386,7 @@ configure_amneziawg_interface() {
     uci set network.@${CONFIG_NAME}[0].endpoint_port=$AWG_ENDPOINT_PORT_INT
     uci commit network
 
+    # Создаем зону фаервола
     if ! uci show firewall | grep -q "@zone.*name='${ZONE_NAME}'"; then
         printf "\033[32;1mZone Create\033[0m\n"
         uci add firewall zone
@@ -385,7 +443,7 @@ add_mark() {
 }
 
 add_zone_vpn() {
-    # Удаляем старые зоны если есть
+    # Удаляем старые зоны если есть (это уже сделано в remove_old_interfaces, но на всякий случай)
     zone_awg_id=$(uci show firewall | grep -E '@zone.*awg1' | awk -F '[][{}]' '{print $2}' | head -n 1)
     if [ "$zone_awg_id" == 0 ] || [ "$zone_awg_id" == 1 ]; then
         printf "\033[32;1mawg1 zone has an identifier of 0 or 1. That's not ok. Fix your firewall. lan and wan zones should have identifiers 0 and 1. \033[0m\n"
@@ -750,6 +808,10 @@ printf "\033[31;1mAll actions performed here cannot be rolled back automatically
 
 # --- ПЕРВАЯ ЧАСТЬ: Установка AWG 2.0 ---
 detect_package_manager
+
+# Удаляем старые пакеты перед установкой новых
+remove_old_packages
+
 check_repo
 install_awg_packages
 
